@@ -12,21 +12,24 @@ Example:
 python demo_webcam.py --model-checkpoint "PATH_TO_CHECKPOINT" --resolution 1280 720 --hide-fps
 """
 
-import argparse, os, shutil, time
-import numpy as np
-import cv2
-import torch
-
+import argparse
+import os
+import shutil
+import time
 from dataclasses import dataclass
+from threading import Thread, Lock
+
+import cv2
+import numpy as np
+import pyfakewebcam  # pip install pyfakewebcam
+import torch
+from PIL import Image
 from torch import nn
 from torch.jit import ScriptModule
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose, ToTensor, Resize
 from torchvision.transforms.functional import to_pil_image
-from threading import Thread, Lock
 from tqdm import tqdm
-from PIL import Image
-import pyfakewebcam # pip install pyfakewebcam
 
 # --------------- App setup ---------------
 app = {
@@ -38,30 +41,8 @@ app = {
     "target_background_frame": 0
 }
 
-# --------------- Arguments ---------------
-
-
-parser = argparse.ArgumentParser(description='Virtual webcam demo')
-
-parser.add_argument('--model-backbone-scale', type=float, default=0.25)
-parser.add_argument('--model-checkpoint', type=str, required=False)
-parser.add_argument('--model-checkpoint-dir', type=str, required=False)
-
-parser.add_argument('--model-refine-mode', type=str, default='sampling', choices=['full', 'sampling', 'thresholding'])
-parser.add_argument('--model-refine-sample-pixels', type=int, default=80_000)
-parser.add_argument('--model-refine-threshold', type=float, default=0.7)
-
-parser.add_argument('--hide-fps', action='store_true')
-parser.add_argument('--resolution', type=int, nargs=2, metavar=('width', 'height'), default=(1280, 720))
-parser.add_argument('--target-video', type=str, default='./demo_video.mp4')
-parser.add_argument('--target-image', type=str, default='./demo_image.jpg')
-parser.add_argument('--camera-device', type=str, default='/dev/video1')
-parser.add_argument('--source_device_id', type=int, default=0)
-args = parser.parse_args()
-
 
 # ----------- Utility classes -------------
-
 
 # A wrapper that reads data from cv2.VideoCapture in its own thread to optimize.
 # Use .read() in a tight loop to get the newest frame
@@ -70,7 +51,7 @@ class Camera:
         self.capture = cv2.VideoCapture(device_id)
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'));
+        self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         # self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)
@@ -144,7 +125,11 @@ class Displayer:
         return cv2.waitKey(1) & 0xFF
 
 
-class Controller: # A cv2 window with a couple buttons for background capture and cycling through target background options
+# A cv2 window with a couple buttons for background capture and cycling through target background options
+class Controller:
+    @staticmethod
+    def to_short_model_name(full_name):
+        return full_name.split('torchscript_')[1]
 
     def __init__(self, model_checkpoint_dir):
         self.name = "RTHRBM Control"
@@ -278,21 +263,27 @@ class Controller: # A cv2 window with a couple buttons for background capture an
 
         ]
 
-        self.compose_cycle = [("plain", "Compose: plain white"), ("gaussian", "Compose: blur background"), ("video", "Compose: Winter holidays"), ("image", "Compose: Mt. Rainier")]
+        self.compose_cycle = [
+            ("plain", "Compose: plain white"),
+            ("gaussian", "Compose: blur background"),
+            ("video", "Compose: Winter holidays"),
+            ("image", "Compose: Mt. Rainier")
+        ]
         self.refine_mode_cycle = [SamplingUpdater(self, 0), ThresholdUpdater(self, 1), FullUpdater(self, 2)]
-        self.refine_mode_updater = self.refine_mode_cycle[self.getRefineModeIndex()]
+        self.refine_mode_updater = self.refine_mode_cycle[self.get_refine_mode_index()]
         self.control_index = {}
         for control in self.controls:
             self.control_index[control["name"]] = control
         self.model_checkpoint_index = -1
-        self.model_checkpoint_cycle = self.getModelCheckpointCycle(model_checkpoint_dir)
+        self.model_checkpoint_cycle = self.get_model_checkpoint_cycle(model_checkpoint_dir)
         self.refine_mode_updater.activate()
+        self.hide_all_except_mode()
         cv2.namedWindow(self.name)
         cv2.moveWindow(self.name, 200, 200)
         cv2.setMouseCallback(self.name, self._raw_process_click)
         self.render()
 
-    def getModelCheckpointCycle(self, model_checkpoint_dir):
+    def get_model_checkpoint_cycle(self, model_checkpoint_dir):
         if model_checkpoint_dir is None:
             self.control_index["model_checkpoint"]["hidden"] = True
             return ()
@@ -309,67 +300,81 @@ class Controller: # A cv2 window with a couple buttons for background capture an
                         self.control_index["model_checkpoint"]["label"] = model_name
         return models
 
-    def to_short_model_name(self, full_name):
-        return full_name.split('torchscript_')[1]
+    def hide_all_except_mode(self):
+        for control in self.controls:
+            if control["name"] != "mode_switch":
+                control["hidden"] = True
 
-    def getRefineModeIndex(self):
+    def get_refine_mode_index(self):
         for idx, updater in enumerate(self.refine_mode_cycle):
             if bgmModel.refine_mode == updater.name():
                 return idx
         return -1
-       
+
     def render(self):
         control_image = np.zeros((500, 400, 3), np.uint8)
         for control in self.controls:
-            if control.get("hidden") == True: continue
+            if control.get("hidden"):
+                continue
             if control["type"] == "button":
-                bgColor = 180
+                bg_color = (180, 180, 180)
             else:
-                bgColor = (255, 255, 255)
-            control_image[control["y"]:control["y"] + control["h"], control["x"]:control["x"] + control["w"]] = bgColor
-            cv2.putText(control_image, control["label"], (control["x"] + 10, control["y"] + control["h"] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-
+                bg_color = (255, 255, 255)
+            control_image[control["y"]:control["y"] + control["h"], control["x"]:control["x"] + control["w"]] = bg_color
+            cv2.putText(control_image, control["label"], (control["x"] + 10, control["y"] + control["h"] // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         cv2.imshow(self.name, control_image)
-        
+
     def clicked(self, control):
         print("control clicked: " + control["name"])
         if control["name"] == "mode_switch":
-            if app["mode"] == "background":
-                grab_bgr()
-                app["mode"] = "stream"
-                control["label"] = "Select another background"
-            else:
-                app["mode"] = "background"
-                control["label"] = "Grab background"
+            self.switch_mode(control)
         elif control["name"] == "compose_switch":
-            current_idx = next(i for i, v in enumerate(self.compose_cycle) if v[0] == app["compose_mode"])
-            next_idx = (current_idx + 1) % len(self.compose_cycle)
-            app["compose_mode"] = self.compose_cycle[next_idx][0]
-            control["label"] = self.compose_cycle[next_idx][1]
+            self.switch_composition(control)
         elif control["name"] == "backbone_scale_+":
-            self.updateBackboneScale(round(min(bgmModel.backbone_scale + .10, 1.0), 2))
+            self.update_backbone_scale(round(min(bgmModel.backbone_scale + .10, 1.0), 2))
         elif control["name"] == "backbone_scale_-":
-            self.updateBackboneScale(round(max(bgmModel.backbone_scale - .10, 0.0), 2))
+            self.update_backbone_scale(round(max(bgmModel.backbone_scale - .10, 0.0), 2))
         elif control["name"] == "refine_mode":
             next_index = (self.refine_mode_updater.index + 1) % len(self.refine_mode_cycle)
             self.refine_mode_updater = self.refine_mode_cycle[next_index]
             self.refine_mode_updater.activate()
         elif control["name"] == "refine_mode_-":
-            self.refine_mode_updater.updateModelValue(-1)
+            self.refine_mode_updater.update_model_value(-1)
         elif control["name"] == "refine_mode_+":
-            self.refine_mode_updater.updateModelValue(1)
+            self.refine_mode_updater.update_model_value(1)
         elif control["name"] == "model_checkpoint":
-            self.updateModelCheckpoint()
+            self.update_model_checkpoint()
         elif control["name"] == "hologram":
             app["effect_mode"] = not app["effect_mode"]
         self.render()
 
-    def updateBackboneScale(self, scale):
+    def switch_mode(self, mode_control):
+        if app["mode"] == "background":
+            grab_bgr()
+            app["mode"] = "stream"
+            mode_control["label"] = "Select another background"
+            for control in self.controls:
+                control["hidden"] = False
+            # let the refine mode class update its control according to it's refine mode specific logic
+            self.refine_mode_updater.activate()
+        else:
+            app["mode"] = "background"
+            mode_control["label"] = "Grab background"
+            self.hide_all_except_mode()
+
+    def switch_composition(self, control):
+        current_idx = next(i for i, v in enumerate(self.compose_cycle) if v[0] == app["compose_mode"])
+        next_idx = (current_idx + 1) % len(self.compose_cycle)
+        app["compose_mode"] = self.compose_cycle[next_idx][0]
+        control["label"] = self.compose_cycle[next_idx][1]
+
+    def update_backbone_scale(self, scale):
         bgmModel.backbone_scale = scale
-        self.control_index["backbone_scale_value"]["label"] = str(scale) 
+        self.control_index["backbone_scale_value"]["label"] = str(scale)
         bgmModel.reload()
 
-    def updateModelCheckpoint(self):
+    def update_model_checkpoint(self):
         next_idx = (self.model_checkpoint_index + 1) % len(self.model_checkpoint_cycle)
         bgmModel.model_checkpoint = self.model_checkpoint_cycle[next_idx][1]
         print(self.model_checkpoint_cycle[next_idx][1])
@@ -380,13 +385,14 @@ class Controller: # A cv2 window with a couple buttons for background capture an
     def _raw_process_click(self, event, x, y, flags, params):
         if event == cv2.EVENT_LBUTTONDOWN:
             for control in self.controls:
-                if control.get("hidden") == True: continue
-                if x > control["x"] and x < control["x"] + control["w"] and y > control["y"] and y < control["y"] + control["h"]:
+                if control.get("hidden"):
+                    continue
+                if x > control["x"] and x < control["x"] + control["w"] \
+                        and y > control["y"] and y < control["y"] + control["h"]:
                     self.clicked(control)
 
 
 class RefineModeUpdater:
-
     def __init__(self, controller, index):
         self.controller = controller
         self.index = index
@@ -394,17 +400,16 @@ class RefineModeUpdater:
     def index(self): pass
     def name(self): pass
     def activate(self): pass
-    def updateModelValue(self, delta): pass
+    def update_model_value(self, delta): pass
 
-    def setControlsHidden(self, isHidden):
-        self.controller.control_index["refine_mode_label"]["hidden"] = isHidden
-        self.controller.control_index["refine_mode_value"]["hidden"] = isHidden
-        self.controller.control_index["refine_mode_-"]["hidden"] = isHidden
-        self.controller.control_index["refine_mode_+"]["hidden"] = isHidden
+    def set_controls_hidden(self, is_hidden):
+        self.controller.control_index["refine_mode_label"]["hidden"] = is_hidden
+        self.controller.control_index["refine_mode_value"]["hidden"] = is_hidden
+        self.controller.control_index["refine_mode_-"]["hidden"] = is_hidden
+        self.controller.control_index["refine_mode_+"]["hidden"] = is_hidden
 
 
 class SamplingUpdater(RefineModeUpdater):
-
     def name(self):
         return 'sampling'
 
@@ -413,20 +418,19 @@ class SamplingUpdater(RefineModeUpdater):
         bgmModel.refine_sample_pixels = 80000
         self.controller.control_index["refine_mode"]["label"] = self.name()
         self.controller.control_index["refine_mode_label"]["label"] = 'pixels'
-        self.updateValueLabel()
-        self.setControlsHidden(False)
+        self.update_value_label()
+        self.set_controls_hidden(False)
 
-    def updateValueLabel(self):
+    def update_value_label(self):
         self.controller.control_index["refine_mode_value"]["label"] = str(bgmModel.refine_sample_pixels)
         bgmModel.reload()
 
-    def updateModelValue(self, delta):
+    def update_model_value(self, delta):
         bgmModel.refine_sample_pixels = max(bgmModel.refine_sample_pixels + delta * 40000, 0)
-        self.updateValueLabel()
+        self.update_value_label()
 
 
 class ThresholdUpdater(RefineModeUpdater):
-
     def name(self):
         return 'thresholding'
 
@@ -435,20 +439,19 @@ class ThresholdUpdater(RefineModeUpdater):
         bgmModel.refine_threshold = .1
         self.controller.control_index["refine_mode"]["label"] = self.name()
         self.controller.control_index["refine_mode_label"]["label"] = 'threshold'
-        self.updateValueLabel()
-        self.setControlsHidden(False)
+        self.update_value_label()
+        self.set_controls_hidden(False)
 
-    def updateValueLabel(self):
+    def update_value_label(self):
         self.controller.control_index["refine_mode_value"]["label"] = str(bgmModel.refine_threshold)
         bgmModel.reload()
 
-    def updateModelValue(self, delta):
-        bgmModel.refine_threshold = min(max(bgmModel.refine_threshold + delta * .01, 0),1.0)
-        self.updateValueLabel()
+    def update_model_value(self, delta):
+        bgmModel.refine_threshold = min(max(bgmModel.refine_threshold + delta * .01, 0), 1.0)
+        self.update_value_label()
 
 
 class FullUpdater(RefineModeUpdater):
-
     def name(self):
         return 'full'
 
@@ -456,9 +459,9 @@ class FullUpdater(RefineModeUpdater):
         bgmModel.refine_mode = self.name()
         self.controller.control_index["refine_mode"]["label"] = self.name()
         bgmModel.reload()
-        self.setControlsHidden(True)
+        self.set_controls_hidden(True)
 
-    def updateModelValue(self, delta):
+    def update_model_value(self, delta):
         # nothing to do
         return
 
@@ -467,19 +470,19 @@ class VideoDataset(Dataset):
     def __init__(self, path: str, transforms: any = None):
         self.cap = cv2.VideoCapture(path)
         self.transforms = transforms
-        
+
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.frame_rate = self.cap.get(cv2.CAP_PROP_FPS)
         self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
+
     def __len__(self):
         return self.frame_count
-    
+
     def __getitem__(self, idx):
         if isinstance(idx, slice):
             return [self[i] for i in range(*idx.indices(len(self)))]
-        
+
         if self.cap.get(cv2.CAP_PROP_POS_FRAMES) != idx:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, img = self.cap.read()
@@ -490,12 +493,13 @@ class VideoDataset(Dataset):
         if self.transforms:
             img = self.transforms(img)
         return img
-    
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_value, exc_traceback):
         self.cap.release()
+
 
 @dataclass
 class BGModel:
@@ -507,39 +511,23 @@ class BGModel:
 
     def model(self):
         return self.model
-        
+
     def reload(self):
         self.model = torch.jit.load(self.model_checkpoint)
         self.model.backbone_scale = self.backbone_scale
         self.model.refine_mode = self.refine_mode
         self.model.refine_sample_pixels = self.refine_sample_pixels
         self.model.model_refine_threshold = self.refine_threshold
-        print(self.refine_mode + " , " + str(self.refine_sample_pixels) + ", " + str(self.refine_threshold))
-        self.model.cuda().eval()        
-        
-
-# --------------- Main ---------------
+        # print(self.refine_mode + " , " + str(self.refine_sample_pixels) + ", " +
+        #       str(self.refine_threshold)+ ", " + str(self.backbone_scale))
+        self.model.cuda().eval()
 
 
-# Load model
-
-bgmModel = BGModel(args.model_checkpoint, args.model_backbone_scale, args.model_refine_mode, args.model_refine_sample_pixels, args.model_refine_threshold)
-#bgmModel.reload() # Controller kicks it off.
-
-source_device_id = args.source_device_id
-width, height = args.resolution
-cam = Camera(device_id=source_device_id, width=width, height=height)
-dsp = Displayer('RTHRBM Preview', cam.width, cam.height, show_info=(not args.hide_fps))
-ctr = Controller(args.model_checkpoint_dir)
-fake_camera = pyfakewebcam.FakeWebcam(args.camera_device, cam.width, cam.height)
-dsp.webcam = fake_camera
+# ----------- Helper Functions -------------
 
 def cv2_frame_to_cuda(frame):
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return ToTensor()(Image.fromarray(frame)).unsqueeze_(0).cuda()
-
-preloaded_image = cv2_frame_to_cuda(cv2.imread(args.target_image))
-tb_video = VideoDataset(args.target_video, transforms=ToTensor())
 
 
 def grab_bgr():
@@ -552,13 +540,13 @@ def grab_bgr():
 def shift_image(img, dx, dy):
     img = np.roll(img, dy, axis=0)
     img = np.roll(img, dx, axis=1)
-    if dy>0:
+    if dy > 0:
         img[:dy, :] = 0
-    elif dy<0:
+    elif dy < 0:
         img[dy:, :] = 0
-    if dx>0:
+    if dx > 0:
         img[:, :dx] = 0
-    elif dx<0:
+    elif dx < 0:
         img[:, dx:] = 0
     return img
 
@@ -567,11 +555,11 @@ def hologram_effect(img):
     # add a blue tint
     holo = cv2.applyColorMap(img, cv2.COLORMAP_WINTER)
     # add a halftone effect
-    bandLength, bandGap = 2, 3
+    band_length, band_gap = 2, 3
 
     for y in range(holo.shape[0]):
-        if y % (bandLength+bandGap) < bandLength:
-            holo[y,:,:] = holo[y,:,:] * np.random.uniform(0.1, 0.3)
+        if y % (band_length + band_gap) < band_length:
+            holo[y, :, :] = holo[y, :, :] * np.random.uniform(0.1, 0.3)
 
     # add some ghosting
     holo_blur = cv2.addWeighted(holo, 0.2, shift_image(holo.copy(), 5, 5), 0.8, 0)
@@ -580,6 +568,7 @@ def hologram_effect(img):
     # combine with the original color, oversaturated
     out = cv2.addWeighted(img, 0.5, holo_blur, 0.6, 0)
     return out
+
 
 def frame_to_hologram(pha, fgr):
     mask = pha * fgr
@@ -607,10 +596,12 @@ def app_step():
             vidframe = tb_video[app["target_background_frame"]].unsqueeze_(0).cuda()
             tgt_bgr = nn.functional.interpolate(vidframe, (fgr.shape[2:]))
             app["target_background_frame"] += 1
+            if app["target_background_frame"] >= tb_video.__len__():
+                app["target_background_frame"] = 0
         elif app["compose_mode"] == "gaussian":
             tgt_bgr = app["bgr_blur"]
 
-        if app["effect_mode"] == True:
+        if app["effect_mode"]:
             fgr = frame_to_hologram(pha, fgr)
 
         res = pha * fgr + (1 - pha) * tgt_bgr
@@ -622,7 +613,45 @@ def app_step():
         if key == ord('q'):
             return True
 
-with torch.no_grad():
-    while True:
-        if app_step():
-            break
+
+def load_args():
+    parser = argparse.ArgumentParser(description='Virtual webcam demo')
+
+    parser.add_argument('--model-backbone-scale', type=float, default=0.25)
+    parser.add_argument('--model-checkpoint', type=str, required=False)
+    parser.add_argument('--model-checkpoint-dir', type=str, required=False)
+
+    parser.add_argument('--model-refine-mode', type=str, default='sampling',
+                        choices=['full', 'sampling', 'thresholding'])
+    parser.add_argument('--model-refine-sample-pixels', type=int, default=80_000)
+    parser.add_argument('--model-refine-threshold', type=float, default=0.7)
+
+    parser.add_argument('--hide-fps', action='store_true')
+    parser.add_argument('--resolution', type=int, nargs=2, metavar=('width', 'height'), default=(1280, 720))
+    parser.add_argument('--target-video', type=str, default='./demo_video.mp4')
+    parser.add_argument('--target-image', type=str, default='./demo_image.jpg')
+    parser.add_argument('--camera-device', type=str, default='/dev/video1')
+    parser.add_argument('--source_device_id', type=int, default=0)
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    args = load_args()
+    bgmModel = BGModel(args.model_checkpoint, args.model_backbone_scale, args.model_refine_mode,
+                       args.model_refine_sample_pixels, args.model_refine_threshold)
+
+    source_device_id = args.source_device_id
+    width, height = args.resolution
+    cam = Camera(device_id=source_device_id, width=width, height=height)
+    dsp = Displayer('RTHRBM Preview', cam.width, cam.height, show_info=(not args.hide_fps))
+    ctr = Controller(args.model_checkpoint_dir)
+    fake_camera = pyfakewebcam.FakeWebcam(args.camera_device, cam.width, cam.height)
+    dsp.webcam = fake_camera
+
+    preloaded_image = cv2_frame_to_cuda(cv2.imread(args.target_image))
+    tb_video = VideoDataset(args.target_video, transforms=ToTensor())
+
+    with torch.no_grad():
+        while True:
+            if app_step():
+                break
