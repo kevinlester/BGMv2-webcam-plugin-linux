@@ -34,6 +34,7 @@ app = {
     "bgr": None,
     "bgr_blur": None,
     "compose_mode": "plain",
+    "effect_mode": False,
     "target_background_frame": 0
 }
 
@@ -261,10 +262,20 @@ class Controller: # A cv2 window with a couple buttons for background capture an
                 "name": "model_checkpoint",
                 "label": "Model: ",
                 "x": 50,
-                "y": 260,
+                "y": 320,
+                "w": 300,
+                "h": 40
+            },
+            {
+                "type": "button",
+                "name": "hologram",
+                "label": "Hologram",
+                "x": 50,
+                "y": 380,
                 "w": 300,
                 "h": 40
             }
+
         ]
 
         self.compose_cycle = [("plain", "Compose: plain white"), ("gaussian", "Compose: blur background"), ("video", "Compose: Winter holidays"), ("image", "Compose: Mt. Rainier")]
@@ -308,7 +319,7 @@ class Controller: # A cv2 window with a couple buttons for background capture an
         return -1
        
     def render(self):
-        control_image = np.zeros((400,400, 3), np.uint8)
+        control_image = np.zeros((500, 400, 3), np.uint8)
         for control in self.controls:
             if control.get("hidden") == True: continue
             if control["type"] == "button":
@@ -349,6 +360,8 @@ class Controller: # A cv2 window with a couple buttons for background capture an
             self.refine_mode_updater.updateModelValue(1)
         elif control["name"] == "model_checkpoint":
             self.updateModelCheckpoint()
+        elif control["name"] == "hologram":
+            app["effect_mode"] = not app["effect_mode"]
         self.render()
 
     def updateBackboneScale(self, scale):
@@ -573,7 +586,7 @@ def frame_to_hologram(pha, fgr):
     mask_img = mask.mul(255).byte().cpu().permute(0, 2, 3, 1).numpy()[0]
     mask_img = cv2.cvtColor(mask_img, cv2.COLOR_RGB2BGR)
     mask_img = hologram_effect(mask_img)
-    return cv2_frame_to_cuda(mask_img) * pha
+    return cv2_frame_to_cuda(mask_img)
 
 
 def app_step():
@@ -597,22 +610,12 @@ def app_step():
         elif app["compose_mode"] == "gaussian":
             tgt_bgr = app["bgr_blur"]
 
-        hologram_mask = frame_to_hologram(pha, fgr)
-        res = hologram_mask + (1 - pha) * tgt_bgr
+        if app["effect_mode"] == True:
+            fgr = frame_to_hologram(pha, fgr)
+
+        res = pha * fgr + (1 - pha) * tgt_bgr
         res = res.mul(255).byte().cpu().permute(0, 2, 3, 1).numpy()[0]
         res = cv2.cvtColor(res, cv2.COLOR_RGB2BGR)
-
-        #res = pha * fgr
-        #res = res.mul(255).byte().cpu().permute(0, 2, 3, 1).numpy()[0]
-        #res = cv2.cvtColor(res, cv2.COLOR_RGB2BGR)
-        #res = hologram_effect(res)
-        #src = cv2_frame_to_cuda(res) * pha
-
-        #res = pha * fgr + (1 - pha) * tgt_bgr
-        #res = res.mul(255).byte().cpu().permute(0, 2, 3, 1).numpy()[0]
-        #res = cv2.cvtColor(res, cv2.COLOR_RGB2BGR)
-
-        ghiDK8ZhiEqWNCEGBvsiwAVg
 
         key = dsp.step(res)
 
