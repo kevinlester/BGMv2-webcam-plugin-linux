@@ -277,7 +277,8 @@ class Controller:
             ("plain", "Compose: plain white"),
             ("gaussian", "Compose: blur background"),
             ("video", "Compose: Winter holidays"),
-            ("image", "Compose: Mt. Rainier")
+            ("image", "Compose: Mt. Rainier"),
+            ("original", "Compose: Original")
         ]
         self.refine_mode_cycle = [SamplingUpdater(self, 0), ThresholdUpdater(self, 1), FullUpdater(self, 2)]
         self.refine_mode_updater = self.refine_mode_cycle[self.get_refine_mode_index()]
@@ -304,7 +305,6 @@ class Controller:
                 if 'torchscript_' in entry.name:
                     model_name = self.to_short_model_name(entry.name)
                     models.append((model_name, model_checkpoint_dir + entry.name))
-                    print(entry.name)
                     if model_name == current_model:
                         self.model_checkpoint_index = len(models)
                         self.control_index["model_checkpoint"]["label"] = model_name
@@ -336,7 +336,6 @@ class Controller:
         cv2.imshow(self.name, control_image)
 
     def clicked(self, control):
-        print("control clicked: " + control["name"])
         if control["name"] == "mode_switch":
             self.switch_mode(control)
         elif control["name"] == "compose_switch":
@@ -389,7 +388,6 @@ class Controller:
     def update_model_checkpoint(self):
         next_idx = (self.model_checkpoint_index + 1) % len(self.model_checkpoint_cycle)
         bgmModel.model_checkpoint = self.model_checkpoint_cycle[next_idx][1]
-        print(self.model_checkpoint_cycle[next_idx][1])
         self.model_checkpoint_index = next_idx
         self.control_index["model_checkpoint"]["label"] = self.model_checkpoint_cycle[next_idx][0]
         bgmModel.reload()
@@ -591,6 +589,7 @@ def frame_to_hologram(pha, fgr):
 
 
 def app_step():
+    background_src = None
     if app["mode"] == "background":
         frame = cam.read()
         key = dsp.step(frame)
@@ -601,7 +600,6 @@ def app_step():
         src = cv2_frame_to_cuda(frame)
         pha, fgr = bgmModel.model(src, app["bgr"])[:2]
         #pha[0,0,:360,:] = 0          # beam in code.
-
 
         if app["compose_mode"] == "plain":
             tgt_bgr = torch.ones_like(fgr)
@@ -615,6 +613,8 @@ def app_step():
                 app["target_background_frame"] = 0
         elif app["compose_mode"] == "gaussian":
             tgt_bgr = app["bgr_blur"]
+        elif app["compose_mode"] == "original":
+            tgt_bgr = app["bgr"]
 
         if app["effect_mode"]:
             fgr = frame_to_hologram(pha, fgr)
