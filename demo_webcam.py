@@ -38,6 +38,7 @@ app = {
     "bgr_blur": None,
     "compose_mode": "plain",
     "effect_mode": False,
+    "ghost_mode": False,
     "target_background_frame": 0
 }
 
@@ -259,6 +260,15 @@ class Controller:
                 "y": 380,
                 "w": 300,
                 "h": 40
+            },
+            {
+                "type": "button",
+                "name": "ghost",
+                "label": "Ghost",
+                "x": 50,
+                "y": 440,
+                "w": 300,
+                "h": 40
             }
 
         ]
@@ -312,7 +322,7 @@ class Controller:
         return -1
 
     def render(self):
-        control_image = np.zeros((500, 400, 3), np.uint8)
+        control_image = np.zeros((560, 400, 3), np.uint8)
         for control in self.controls:
             if control.get("hidden"):
                 continue
@@ -347,6 +357,8 @@ class Controller:
             self.update_model_checkpoint()
         elif control["name"] == "hologram":
             app["effect_mode"] = not app["effect_mode"]
+        elif control["name"] == "ghost":
+            app["ghost_mode"] = not app["ghost_mode"]
         self.render()
 
     def switch_mode(self, mode_control):
@@ -588,6 +600,9 @@ def app_step():
         frame = cam.read()
         src = cv2_frame_to_cuda(frame)
         pha, fgr = bgmModel.model(src, app["bgr"])[:2]
+        #pha[0,0,:360,:] = 0          # beam in code.
+
+
         if app["compose_mode"] == "plain":
             tgt_bgr = torch.ones_like(fgr)
         elif app["compose_mode"] == "image":
@@ -603,6 +618,8 @@ def app_step():
 
         if app["effect_mode"]:
             fgr = frame_to_hologram(pha, fgr)
+        if app["ghost_mode"]:
+            pha[0,0,:,:] *= .5
 
         res = pha * fgr + (1 - pha) * tgt_bgr
         res = res.mul(255).byte().cpu().permute(0, 2, 3, 1).numpy()[0]
